@@ -1,0 +1,13 @@
+[package]
+name = "graphite"
+version = "0.1.0"
+edition = "2021"
+description = "A small graph database with its own query language"
+license = "MIT"
+rust-version = "1.75"
+
+[lib]
+name = "graphite"
+path = "src/lib.rs"
+
+[dependencies]
