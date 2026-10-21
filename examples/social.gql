@@ -1,0 +1,44 @@
+// Graphite sample script.
+// Run with: cargo run -- examples/social.gql
+
+CREATE
+  (alice:Person {name: "Alice", age: 30, city: "Nairobi"}),
+  (bob:Person {name: "Bob", age: 27, city: "Mombasa"}),
+  (carol:Person {name: "Carol", age: 35, city: "Nairobi"}),
+  (dave:Person {name: "Dave", age: 41, city: "Kisumu"}),
+  (acme:Company {name: "Acme", founded: 2015}),
+  (orbit:Company {name: "Orbit", founded: 2020}),
+  (alice)-[:KNOWS {since: 2019}]->(bob),
+  (bob)-[:KNOWS {since: 2021}]->(carol),
+  (carol)-[:KNOWS {since: 2017}]->(dave),
+  (alice)-[:WORKS_AT {role: "Engineer"}]->(acme),
+  (bob)-[:WORKS_AT {role: "Designer"}]->(acme),
+  (carol)-[:WORKS_AT {role: "CTO"}]->(orbit),
+  (dave)-[:WORKS_AT {role: "Engineer"}]->(orbit);
+
+// Who knows whom?
+MATCH (a:Person)-[r:KNOWS]->(b:Person)
+RETURN a.name AS from, b.name AS to, r.since AS since
+ORDER BY from;
+
+// Two-hop reachability.
+MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)
+RETURN a.name AS from, c.name AS reachable
+ORDER BY from, reachable;
+
+// People and the companies they work for.
+MATCH (p:Person)-[r:WORKS_AT]->(c:Company)
+RETURN p.name AS person, c.name AS company, r.role AS role
+ORDER BY company, person;
+
+// Grouping and aggregation.
+MATCH (p:Person)
+RETURN p.city AS city, count(*) AS people, avg(p.age) AS average_age
+ORDER BY people DESC, city;
+
+// A simple update followed by a read.
+MATCH (p:Person) WHERE p.name = "Alice"
+SET p.age = p.age + 1, p.active = true;
+
+MATCH (p:Person) WHERE p.active = true
+RETURN p.name, p.age;
