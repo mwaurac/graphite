@@ -10,4 +10,8 @@ rust-version = "1.75"
 name = "graphite"
 path = "src/lib.rs"
 
+[[bin]]
+name = "graphite"
+path = "src/main.rs"
+
 [dependencies]
