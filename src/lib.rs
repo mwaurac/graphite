@@ -19,11 +19,13 @@ pub mod executor;
 pub mod graph;
 pub mod lexer;
 pub mod parser;
+pub mod serial;
 pub mod value;
 
 pub use error::{Error, Result};
 pub use executor::{Database, QueryResult, Stats};
 pub use graph::{Edge, EdgeId, Graph, Node, NodeId};
+pub use serial::graph_to_script;
 pub use value::Value;
 
 /// A small sample graph used by `:demo` in the REPL and by the examples.

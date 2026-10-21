@@ -156,6 +156,21 @@ impl Database {
         &self.graph
     }
 
+    /// Build a database from a script, replacing nothing (the database is new).
+    pub fn from_script(source: &str) -> Result<Self> {
+        let statements = parse_program(source)?;
+        let mut db = Database::new();
+        for statement in &statements {
+            db.execute_statement(statement)?;
+        }
+        Ok(db)
+    }
+
+    /// Render the graph as a script that can be loaded with [`Database::from_script`].
+    pub fn dump(&self) -> String {
+        crate::serial::graph_to_script(&self.graph)
+    }
+
     /// Parse and execute one or more `;`-separated statements.
     pub fn execute(&mut self, source: &str) -> Result<Vec<QueryResult>> {
         let statements = parse_program(source)?;
