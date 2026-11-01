@@ -234,14 +234,14 @@ impl Database {
         self.last_sequence
     }
 
-    /// Start a transaction. Read-only transactions do not copy the graph;
-    /// the first write in a transaction stages a copy for atomic commit.
+    /// Start a transaction. Changes are applied to the live graph and recorded
+    /// in an undo journal; read-only transactions do not record anything.
     pub fn begin(&mut self) -> Transaction<'_> {
         Transaction {
             db: self,
-            staged: None,
             sources: Vec::new(),
             failed: false,
+            finished: false,
         }
     }
 
@@ -282,7 +282,7 @@ impl Database {
         Ok(results)
     }
 
-    fn commit_graph(&mut self, graph: Graph, sources: &[String]) -> Result<()> {
+    fn commit_graph(&mut self, sources: &[String]) -> Result<()> {
         if sources.is_empty() {
             return Ok(());
         }
@@ -293,7 +293,6 @@ impl Database {
             storage.append(sequence, payload.as_bytes())?;
         }
 
-        self.graph = graph;
         self.last_sequence = sequence;
         Ok(())
     }
@@ -1459,14 +1458,14 @@ impl Database {
 
 /// An explicit multi-statement transaction.
 ///
-/// A transaction stages its first write in a graph copy. `commit` appends one
-/// durable WAL record and installs the staged graph; dropping or calling
-/// [`Transaction::rollback`] discards it.
+/// Writes are applied to the live graph and recorded in an undo journal.
+/// `commit` appends one durable WAL record and discards the journal; dropping
+/// the transaction or calling [`Transaction::rollback`] reverts its changes.
 pub struct Transaction<'a> {
     db: &'a mut Database,
-    staged: Option<Graph>,
     sources: Vec<String>,
     failed: bool,
+    finished: bool,
 }
 
 impl<'a> Transaction<'a> {
@@ -1491,26 +1490,11 @@ impl<'a> Transaction<'a> {
         }
 
         let writes = statements.iter().any(Statement::is_write);
-
-        if !writes && self.staged.is_none() {
-            let result = self.db.execute_in_place(source);
-            if result.is_err() {
-                self.failed = true;
-            }
-            return result;
+        if writes {
+            self.db.graph.begin_undo();
         }
 
-        if self.staged.is_none() {
-            self.staged = Some(self.db.graph.clone());
-        }
-
-        let live = std::mem::replace(
-            &mut self.db.graph,
-            self.staged.take().expect("staged graph exists"),
-        );
         let result = self.db.execute_in_place(source);
-        self.staged = Some(std::mem::replace(&mut self.db.graph, live));
-
         match result {
             Ok(results) => {
                 if writes {
@@ -1528,25 +1512,49 @@ impl<'a> Transaction<'a> {
     /// Durably commit the transaction.
     pub fn commit(mut self) -> Result<()> {
         if self.failed {
+            self.db.graph.rollback_undo();
+            self.finished = true;
             return Err(Error::new(
                 "cannot commit: the transaction is aborted; no changes were applied",
             ));
         }
 
-        match self.staged.take() {
-            Some(graph) => {
-                let sources = std::mem::take(&mut self.sources);
-                self.db.commit_graph(graph, &sources)
+        if !self.db.graph.has_undo() {
+            self.finished = true;
+            return Ok(());
+        }
+
+        let sources = std::mem::take(&mut self.sources);
+        match self.db.commit_graph(&sources) {
+            Ok(()) => {
+                self.db.graph.commit_undo();
+                self.finished = true;
+                Ok(())
             }
-            None => Ok(()),
+            Err(error) => {
+                self.db.graph.rollback_undo();
+                self.finished = true;
+                Err(error)
+            }
         }
     }
 
     /// Discard all changes made inside the transaction.
-    pub fn rollback(self) {}
+    pub fn rollback(mut self) {
+        self.db.graph.rollback_undo();
+        self.finished = true;
+    }
 
     pub fn is_failed(&self) -> bool {
         self.failed
+    }
+}
+
+impl Drop for Transaction<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.db.graph.rollback_undo();
+        }
     }
 }
 

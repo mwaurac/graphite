@@ -45,6 +45,33 @@ pub struct Graph {
     labels: HashMap<String, BTreeSet<NodeId>>,
     outgoing: HashMap<NodeId, BTreeSet<EdgeId>>,
     incoming: HashMap<NodeId, BTreeSet<EdgeId>>,
+    journal: Option<UndoJournal>,
+}
+
+/// Inverse operations recorded while a transaction is active.
+#[derive(Clone, Debug)]
+struct UndoJournal {
+    entries: Vec<UndoEntry>,
+    next_node_id: NodeId,
+    next_edge_id: EdgeId,
+}
+
+#[derive(Clone, Debug)]
+enum UndoEntry {
+    CreatedNode(NodeId),
+    CreatedEdge(EdgeId),
+    SetNodeProperty {
+        id: NodeId,
+        key: String,
+        previous: Option<Value>,
+    },
+    SetEdgeProperty {
+        id: EdgeId,
+        key: String,
+        previous: Option<Value>,
+    },
+    RemovedEdge(Edge),
+    RemovedNode(Node),
 }
 
 impl Graph {
@@ -53,6 +80,128 @@ impl Graph {
             next_node_id: 1,
             next_edge_id: 1,
             ..Graph::default()
+        }
+    }
+
+    /// Start recording inverse operations for a transaction. Nested journals
+    /// are not supported; the first call wins.
+    pub(crate) fn begin_undo(&mut self) {
+        if self.journal.is_none() {
+            self.journal = Some(UndoJournal {
+                entries: Vec::new(),
+                next_node_id: self.next_node_id,
+                next_edge_id: self.next_edge_id,
+            });
+        }
+    }
+
+    /// Keep all changes and stop recording undo entries.
+    pub(crate) fn commit_undo(&mut self) {
+        self.journal = None;
+    }
+
+    /// Revert every change recorded since [`Graph::begin_undo`].
+    pub(crate) fn rollback_undo(&mut self) {
+        let Some(journal) = self.journal.take() else {
+            return;
+        };
+
+        for entry in journal.entries.into_iter().rev() {
+            self.revert(entry);
+        }
+        self.next_node_id = journal.next_node_id;
+        self.next_edge_id = journal.next_edge_id;
+    }
+
+    pub(crate) fn has_undo(&self) -> bool {
+        self.journal.is_some()
+    }
+
+    fn record_undo(&mut self, entry: UndoEntry) {
+        if let Some(journal) = &mut self.journal {
+            journal.entries.push(entry);
+        }
+    }
+
+    fn revert(&mut self, entry: UndoEntry) {
+        match entry {
+            UndoEntry::CreatedNode(id) => {
+                if let Some(node) = self.nodes.remove(&id) {
+                    self.unindex_node(&node);
+                }
+            }
+            UndoEntry::CreatedEdge(id) => {
+                if let Some(edge) = self.edges.remove(&id) {
+                    self.unlink_edge(&edge);
+                }
+            }
+            UndoEntry::SetNodeProperty { id, key, previous } => {
+                if let Some(node) = self.nodes.get_mut(&id) {
+                    match previous {
+                        Some(value) => {
+                            node.props.insert(key, value);
+                        }
+                        None => {
+                            node.props.remove(&key);
+                        }
+                    }
+                }
+            }
+            UndoEntry::SetEdgeProperty { id, key, previous } => {
+                if let Some(edge) = self.edges.get_mut(&id) {
+                    match previous {
+                        Some(value) => {
+                            edge.props.insert(key, value);
+                        }
+                        None => {
+                            edge.props.remove(&key);
+                        }
+                    }
+                }
+            }
+            UndoEntry::RemovedEdge(edge) => {
+                let id = edge.id;
+                let from = edge.from;
+                let to = edge.to;
+                self.edges.insert(id, edge);
+                self.outgoing.entry(from).or_default().insert(id);
+                self.incoming.entry(to).or_default().insert(id);
+            }
+            UndoEntry::RemovedNode(node) => {
+                for label in &node.labels {
+                    self.labels
+                        .entry(label.clone())
+                        .or_default()
+                        .insert(node.id);
+                }
+                self.nodes.insert(node.id, node);
+            }
+        }
+    }
+
+    fn unindex_node(&mut self, node: &Node) {
+        for label in &node.labels {
+            if let Some(ids) = self.labels.get_mut(label) {
+                ids.remove(&node.id);
+                if ids.is_empty() {
+                    self.labels.remove(label);
+                }
+            }
+        }
+    }
+
+    fn unlink_edge(&mut self, edge: &Edge) {
+        if let Some(ids) = self.outgoing.get_mut(&edge.from) {
+            ids.remove(&edge.id);
+            if ids.is_empty() {
+                self.outgoing.remove(&edge.from);
+            }
+        }
+        if let Some(ids) = self.incoming.get_mut(&edge.to) {
+            ids.remove(&edge.id);
+            if ids.is_empty() {
+                self.incoming.remove(&edge.to);
+            }
         }
     }
 
@@ -137,6 +286,7 @@ impl Graph {
                 props,
             },
         );
+        self.record_undo(UndoEntry::CreatedNode(id));
         id
     }
 
@@ -173,41 +323,44 @@ impl Graph {
         );
         self.outgoing.entry(from).or_default().insert(id);
         self.incoming.entry(to).or_default().insert(id);
+        self.record_undo(UndoEntry::CreatedEdge(id));
         Ok(id)
     }
 
     /// Set a property on a node or relationship. Returns true when the
     /// property did not exist before.
     pub fn set_node_property(&mut self, id: NodeId, key: String, value: Value) -> Result<bool> {
-        let node = self
-            .nodes
-            .get_mut(&id)
-            .ok_or_else(|| Error::new(format!("node #{id} no longer exists")))?;
-        Ok(node.props.insert(key, value).is_none())
+        let (previous, inserted) = {
+            let node = self
+                .nodes
+                .get_mut(&id)
+                .ok_or_else(|| Error::new(format!("node #{id} no longer exists")))?;
+            let previous = node.props.get(&key).cloned();
+            let inserted = node.props.insert(key.clone(), value).is_none();
+            (previous, inserted)
+        };
+        self.record_undo(UndoEntry::SetNodeProperty { id, key, previous });
+        Ok(inserted)
     }
 
     pub fn set_edge_property(&mut self, id: EdgeId, key: String, value: Value) -> Result<bool> {
-        let edge = self
-            .edges
-            .get_mut(&id)
-            .ok_or_else(|| Error::new(format!("relationship #{id} no longer exists")))?;
-        Ok(edge.props.insert(key, value).is_none())
+        let (previous, inserted) = {
+            let edge = self
+                .edges
+                .get_mut(&id)
+                .ok_or_else(|| Error::new(format!("relationship #{id} no longer exists")))?;
+            let previous = edge.props.get(&key).cloned();
+            let inserted = edge.props.insert(key.clone(), value).is_none();
+            (previous, inserted)
+        };
+        self.record_undo(UndoEntry::SetEdgeProperty { id, key, previous });
+        Ok(inserted)
     }
 
     pub fn remove_edge(&mut self, id: EdgeId) -> Option<Edge> {
         let edge = self.edges.remove(&id)?;
-        if let Some(ids) = self.outgoing.get_mut(&edge.from) {
-            ids.remove(&id);
-            if ids.is_empty() {
-                self.outgoing.remove(&edge.from);
-            }
-        }
-        if let Some(ids) = self.incoming.get_mut(&edge.to) {
-            ids.remove(&id);
-            if ids.is_empty() {
-                self.incoming.remove(&edge.to);
-            }
-        }
+        self.unlink_edge(&edge);
+        self.record_undo(UndoEntry::RemovedEdge(edge.clone()));
         Some(edge)
     }
 
@@ -233,14 +386,8 @@ impl Graph {
         }
 
         let node = self.nodes.remove(&id).expect("node checked above");
-        for label in &node.labels {
-            if let Some(ids) = self.labels.get_mut(label) {
-                ids.remove(&id);
-                if ids.is_empty() {
-                    self.labels.remove(label);
-                }
-            }
-        }
+        self.unindex_node(&node);
+        self.record_undo(UndoEntry::RemovedNode(node));
 
         Ok(removed_edges)
     }

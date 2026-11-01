@@ -117,6 +117,98 @@ fn a_parse_error_aborts_an_explicit_transaction() {
 }
 
 #[test]
+fn rollback_restores_deleted_nodes_and_relationships() {
+    let mut db = Database::new();
+    db.execute(
+        r#"CREATE (a:Person {name: "Alice"})-[:KNOWS {since: 2019}]->(b:Person {name: "Bob"})"#,
+    )
+    .unwrap();
+    let before = db.dump();
+
+    let mut transaction = db.begin();
+    transaction.execute("MATCH (n) DETACH DELETE n").unwrap();
+    let remaining = transaction
+        .execute("MATCH (n) RETURN count(*) AS count")
+        .unwrap()
+        .remove(0)
+        .rows
+        .remove(0)
+        .remove(0);
+    assert_eq!(remaining, Value::Int(0));
+    transaction.rollback();
+
+    assert_eq!(db.graph().node_count(), 2);
+    assert_eq!(db.graph().edge_count(), 1);
+    assert_eq!(db.dump(), before);
+
+    // IDs allocated by the rolled-back transaction must be reusable.
+    assert_eq!(
+        scalar(&mut db, "CREATE (c:Person) RETURN id(c)"),
+        Value::Int(3)
+    );
+}
+
+#[test]
+fn rollback_restores_changed_and_added_properties() {
+    let mut db = Database::new();
+    db.execute(r#"CREATE (:Item {name: "widget", active: true})"#)
+        .unwrap();
+
+    let mut transaction = db.begin();
+    transaction
+        .execute(r#"MATCH (n:Item) SET n.active = false, n.added = 42"#)
+        .unwrap();
+    transaction.rollback();
+
+    assert_eq!(
+        scalar(&mut db, "MATCH (n:Item) RETURN n.active"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        scalar(&mut db, "MATCH (n:Item) RETURN n.added"),
+        Value::Null
+    );
+}
+
+#[test]
+fn a_failed_delete_and_create_restores_the_original_graph() {
+    let mut db = Database::new();
+    db.execute(r#"CREATE (:Person {name: "Alice"})-[:KNOWS]->(:Person {name: "Bob"})"#)
+        .unwrap();
+    let before = db.dump();
+
+    let error = db
+        .execute(
+            r#"
+            MATCH (n) DETACH DELETE n;
+            CREATE (a:Person {name: "A"}), (a:Person {name: "B"}), (:Person {name: "C"});
+            "#,
+        )
+        .unwrap_err();
+    assert!(error.message.contains("already bound"));
+    assert_eq!(db.dump(), before);
+    assert_eq!(db.graph().node_count(), 2);
+    assert_eq!(db.graph().edge_count(), 1);
+}
+
+#[test]
+fn committed_deletes_survive_reopening() {
+    let directory = TempDirectory::new();
+
+    {
+        let mut db = Database::open(&directory.0).unwrap();
+        db.execute(r#"CREATE (:A)-[:LINK]->(:B)"#).unwrap();
+        db.execute("MATCH (n) DETACH DELETE n").unwrap();
+    }
+
+    {
+        let db = Database::open(&directory.0).unwrap();
+        assert_eq!(db.graph().node_count(), 0);
+        assert_eq!(db.graph().edge_count(), 0);
+    }
+}
+
+#[test]
 fn a_database_directory_is_locked_while_open() {
     let directory = TempDirectory::new();
     let db = Database::open(&directory.0).unwrap();
