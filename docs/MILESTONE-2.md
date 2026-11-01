@@ -19,8 +19,9 @@ Milestone 2a adds:
 1. **Atomic scripts.** `Database::execute` treats every call as one transaction.
    If any statement fails, no statement in that call is applied.
 2. **Explicit transactions.** `Database::begin()` returns a `Transaction` with
-   `execute`, `commit`, and `rollback`. A failed transaction is aborted and cannot
-   be committed.
+   `execute`, `commit`, and `rollback`. Writes are applied to the live graph and an
+   undo journal reverts them on rollback or failure. A failed transaction is
+   aborted and cannot be committed.
 3. **Durable commits.** `Database::open(dir)` enables a write-ahead log. A commit
    returns only after its WAL record has been written and `fsync`ed.
 4. **Crash recovery.** On startup Graphite loads the snapshot, replays valid WAL
@@ -51,12 +52,13 @@ tx.execute(r#"CREATE (:Person {name: "Bob"})"#)?;
 tx.commit()?;
 ```
 
-- A transaction is staged on a **copy of the graph**, created lazily on the first
-  write. Read-only transactions and read-only queries do not copy the graph.
-- `commit` appends one WAL record for the transaction and then installs the staged
-  graph in memory.
-- Dropping a transaction without committing rolls it back. `rollback` is an
-  explicit no-op that consumes the transaction for readability.
+- Writes are applied to the live graph and recorded in an **undo journal**.
+  Read-only transactions record nothing and do not copy the graph.
+- `commit` appends one WAL record for the transaction and then discards the undo
+  journal. If the WAL append fails, the journal reverts the in-memory changes.
+- Dropping a transaction without committing rolls it back by replaying the undo
+  journal in reverse. `rollback` does the same explicitly and consumes the
+  transaction.
 - Any execution error aborts the transaction. This matches the common SQL
   behaviour: a failed transaction must be rolled back rather than partially
   committed.
@@ -117,8 +119,10 @@ Commit:
 
 1. Append the WAL record.
 2. `fsync` the WAL.
-3. Install the staged graph in memory.
+3. Discard the undo journal (the in-memory graph already contains the changes).
 4. Return success.
+
+If step 1 or 2 fails, the undo journal reverts the in-memory changes.
 
 Checkpoint:
 
@@ -167,6 +171,11 @@ silently running unprotected.
 
 - A statement that fails midway leaves the graph byte-for-byte unchanged.
 - Explicit `commit` and `rollback`.
+- Rolling back deletes restores nodes, relationships, labels, properties, and ID
+  allocation.
+- Rolling back `SET` restores changed and newly added properties.
+- A failed delete-and-create script restores the original graph.
+- Committed deletes survive reopening.
 - An aborted transaction cannot commit.
 - Read-only transactions do not advance the sequence.
 - Committed nodes and relationships survive reopening.
@@ -193,11 +202,9 @@ These are deliberate cuts for this slice, not accidental omissions:
 
 ### Storage and performance
 
-- **Whole-graph copy per write transaction.** The first write clones the graph.
-  This is correct but O(graph size) per transaction and unsuitable for large
-  databases. The next step is an undo log or copy-on-write node/edge storage.
 - **Full snapshot checkpoints.** Every checkpoint serialises the entire graph.
-  A production design needs incremental checkpoints or a log-structured store.
+  Transactions are incremental, but a production design still needs incremental
+  checkpoints or a log-structured store.
 - **The WAL grows until an explicit checkpoint or reopen.** There is no background
   checkpoint policy, group commit, or WAL size limit.
 - **Exclusive advisory locking only.** The lock excludes concurrent readers as
@@ -215,8 +222,9 @@ These are deliberate cuts for this slice, not accidental omissions:
 - **Single writer, no concurrent readers.** `&mut Database` prevents sharing
   within Rust, and the directory lock excludes other processes entirely; there is
   no MVCC or read-only mode.
-- **No isolation levels.** A transaction sees its own staged writes; other
-  transactions cannot run concurrently because of the mutable borrow.
+- **No isolation levels.** A transaction sees its own uncommitted writes because
+  it operates on the live graph; other transactions cannot run concurrently
+  because of the mutable borrow.
 - **Abort-on-first-error.** There are no savepoints.
 - **No durability level configuration.** Every commit pays for `fsync`.
 - **No transaction timeout or deadlock handling.** Deadlocks cannot occur without
@@ -229,9 +237,9 @@ These are deliberate cuts for this slice, not accidental omissions:
 ### Correctness and semantics
 
 - **No semantic-analysis pass.** Some errors are discovered after earlier
-  statements in the same transaction have mutated the staged copy. Atomicity
-  prevents those changes from being committed, but a pre-execution validation
-  pass would be cheaper and clearer.
+  statements in the same transaction have mutated the graph. Atomicity prevents
+  those changes from being committed, but a pre-execution validation pass would be
+  cheaper and clearer.
 - **No constraints or uniqueness.** Duplicate logical entities are still allowed.
 - **No parameters.** Queries are re-parsed and re-logged as source text.
 - **Replay depends on deterministic query execution.** IDs and iteration order are
@@ -244,17 +252,16 @@ These are deliberate cuts for this slice, not accidental omissions:
 
 In priority order:
 
-1. **Undo-log transactions** to remove the whole-graph clone per write.
+1. **Checkpoint policy** based on WAL bytes or commit count, with an online
+   incremental checkpoint that does not stall large writes.
 2. **Savepoints and statement-level error recovery** for long transactions.
 3. **Semantic analysis before mutation** to reject invalid label/property updates
    and bound-variable reuse up front.
 4. **Constraints and unique indexes**, especially uniqueness on a chosen identity
    property.
-5. **Checkpoint policy** based on WAL bytes or commit count, with an online
-   checkpoint that does not stall large writes.
-6. **Parameterised queries**, then property indexes and `EXPLAIN`.
-7. **Snapshot checksums and format versioning**, then migration tests.
-8. **Read-only/shared locking, multi-process server mode, and MVCC** after the
+5. **Parameterised queries**, then property indexes and `EXPLAIN`.
+6. **Snapshot checksums and format versioning**, then migration tests.
+7. **Read-only/shared locking, multi-process server mode, and MVCC** after the
    single-node storage layer is efficient.
 
 ---
@@ -263,7 +270,7 @@ In priority order:
 
 The Milestone 1 gap analysis listed statement atomicity, WAL durability, crash
 recovery, and a transaction API as the top four recommendations. This slice
-implements the single-process versions of all four, and adds an exclusive
-directory lock so separate processes cannot corrupt the same WAL. The remaining
-top gap is **performance**: copy-free transactions and incremental checkpoints
-matter more now than new syntax.
+implements the single-process versions of all four, adds an exclusive directory
+lock so separate processes cannot corrupt the same WAL, and replaced whole-graph
+transaction copies with an undo journal. The remaining top gap is **online,
+incremental checkpointing**, followed by constraints and semantic validation.

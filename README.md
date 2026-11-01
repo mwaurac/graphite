@@ -223,12 +223,12 @@ tx.rollback(); // nothing is written
 ```
 
 A transaction that hits an execution error is aborted and cannot be committed.
-Read-only transactions do not copy the graph; the first write stages a graph copy
-for atomic commit. A persistent database directory is exclusively locked while it
-is open, so a second process receives a clear error instead of corrupting the WAL.
-There is no shared-reader mode yet. See
-[`docs/MILESTONE-2.md`](docs/MILESTONE-2.md) for the on-disk format, crash windows,
-and current limitations.
+Read-only transactions do not copy the graph; writes are applied to the live graph
+and recorded in an undo journal so rollback is proportional to the changes. A
+persistent database directory is exclusively locked while it is open, so a second
+process receives a clear error instead of corrupting the WAL. There is no
+shared-reader mode yet. See [`docs/MILESTONE-2.md`](docs/MILESTONE-2.md) for the
+on-disk format, crash windows, and current limitations.
 
 The query language is also still an import/export format. A snapshot is a valid
 Graphite script:
@@ -272,7 +272,7 @@ src/
   lexer.rs      tokens, source positions, comments
   ast.rs        statements, patterns, expressions
   parser.rs     recursive-descent parser
-  graph.rs      property graph, label index, adjacency index
+  graph.rs      property graph, indexes, transaction undo journal
   executor.rs   transactions, pattern matching, mutation, aggregation
   storage.rs    WAL, atomic snapshots, crash recovery
   serial.rs     graph snapshots as Graphite scripts
@@ -311,9 +311,10 @@ Deliberately not in this milestone:
 - Constraints and unique indexes
 - A cost-based planner and an efficient on-disk storage engine
 
-The transaction layer currently stages a whole-graph copy on the first write, and
-checkpoints serialise the entire graph. Those are the main performance limits to
-address next, along with process locking. See
+The transaction layer records inverse operations in an undo journal instead of
+copying the graph, but checkpoints still serialise the entire graph. Full
+checkpoints and WAL growth are the main performance limits to address next, along
+with savepoints and constraints. See
 [`docs/MILESTONE-2.md`](docs/MILESTONE-2.md).
 
 ## License
