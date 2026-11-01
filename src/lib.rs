@@ -20,10 +20,11 @@ pub mod graph;
 pub mod lexer;
 pub mod parser;
 pub mod serial;
+mod storage;
 pub mod value;
 
 pub use error::{Error, Result};
-pub use executor::{Database, QueryResult, Stats};
+pub use executor::{Database, QueryResult, Stats, Transaction};
 pub use graph::{Edge, EdgeId, Graph, Node, NodeId};
 pub use serial::graph_to_script;
 pub use value::Value;

@@ -212,6 +212,17 @@ impl std::fmt::Display for Expr {
     }
 }
 
+impl Statement {
+    pub fn is_write(&self) -> bool {
+        match self {
+            Statement::Create { .. } => true,
+            Statement::Match { action, .. } => {
+                matches!(action, MatchAction::Set { .. } | MatchAction::Delete { .. })
+            }
+        }
+    }
+}
+
 impl NodePattern {
     pub fn describe(&self) -> String {
         let mut out = String::from("(");

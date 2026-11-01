@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 
 use crate::ast::{
     Assignment, BinaryOp, Direction, Expr, MatchAction, NodePattern, Pattern, RelChain, RelPattern,
@@ -8,6 +9,7 @@ use crate::ast::{
 use crate::error::{Error, Result};
 use crate::graph::{Edge, EdgeId, Graph, Node, NodeId};
 use crate::parser::parse_program;
+use crate::storage::{self, Storage};
 use crate::value::Value;
 
 #[derive(Clone, Debug)]
@@ -139,29 +141,113 @@ impl QueryResult {
     }
 }
 
-/// A graph database instance. For this milestone the graph lives in memory.
-#[derive(Clone, Debug, Default)]
+/// A graph database instance.
+///
+/// Created with [`Database::new`], it lives entirely in memory. Created with
+/// [`Database::open`], it records every committed transaction in a
+/// write-ahead log and recovers from that log on startup.
+#[derive(Debug)]
 pub struct Database {
     graph: Graph,
+    storage: Option<Storage>,
+    last_sequence: u64,
+}
+
+impl Default for Database {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Database {
     pub fn new() -> Self {
         Database {
             graph: Graph::new(),
+            storage: None,
+            last_sequence: 0,
         }
+    }
+
+    /// Open or create a database in a directory.
+    ///
+    /// Recovery loads `snapshot.gql`, replays valid WAL records after the
+    /// snapshot sequence, then checkpoints so the WAL starts clean.
+    pub fn open(directory: impl AsRef<Path>) -> Result<Self> {
+        let directory = directory.as_ref();
+        let snapshot = storage::read_snapshot(directory)?;
+
+        let mut db = match snapshot {
+            Some((sequence, script)) => {
+                let mut db = Database::from_script(&script)?;
+                db.last_sequence = sequence;
+                db
+            }
+            None => Database::new(),
+        };
+
+        let records = storage::read_wal(directory)?;
+        let had_records = !records.is_empty();
+
+        for (sequence, payload) in records {
+            if sequence <= db.last_sequence {
+                continue;
+            }
+
+            let source = String::from_utf8(payload).map_err(|error| {
+                Error::new(format!(
+                    "write-ahead log record {sequence} is not valid UTF-8: {error}"
+                ))
+            })?;
+
+            let mut transaction = db.begin();
+            transaction.execute(&source).map_err(|error| {
+                Error::new(format!(
+                    "cannot replay write-ahead log record {sequence}: {error}"
+                ))
+            })?;
+            transaction.commit()?;
+            db.last_sequence = sequence;
+        }
+
+        db.storage = Some(Storage::open(directory)?);
+        if had_records {
+            db.checkpoint()?;
+        }
+
+        Ok(db)
     }
 
     pub fn graph(&self) -> &Graph {
         &self.graph
     }
 
+    /// The directory backing this database, if it is persistent.
+    pub fn directory(&self) -> Option<&Path> {
+        self.storage.as_ref().map(Storage::directory)
+    }
+
+    /// The sequence number of the last committed transaction.
+    pub fn last_sequence(&self) -> u64 {
+        self.last_sequence
+    }
+
+    /// Start a transaction. Read-only transactions do not copy the graph;
+    /// the first write in a transaction stages a copy for atomic commit.
+    pub fn begin(&mut self) -> Transaction<'_> {
+        Transaction {
+            db: self,
+            staged: None,
+            sources: Vec::new(),
+            failed: false,
+        }
+    }
+
     /// Build a database from a script, replacing nothing (the database is new).
     pub fn from_script(source: &str) -> Result<Self> {
         let statements = parse_program(source)?;
         let mut db = Database::new();
-        for statement in &statements {
-            db.execute_statement(statement)?;
+        if !statements.is_empty() {
+            db.execute(source)?;
         }
         Ok(db)
     }
@@ -171,8 +257,45 @@ impl Database {
         crate::serial::graph_to_script(&self.graph)
     }
 
-    /// Parse and execute one or more `;`-separated statements.
+    /// Force a durable snapshot and truncate the write-ahead log.
+    ///
+    /// This is a no-op for in-memory databases.
+    pub fn checkpoint(&mut self) -> Result<()> {
+        if let Some(storage) = self.storage.as_mut() {
+            let script = crate::serial::graph_to_script(&self.graph);
+            let sequence = self.last_sequence;
+            storage.checkpoint(sequence, &script)?;
+        }
+        Ok(())
+    }
+
+    /// Parse and execute one or more `;`-separated statements atomically.
+    ///
+    /// Either every statement commits, or the graph is left unchanged.
     pub fn execute(&mut self, source: &str) -> Result<Vec<QueryResult>> {
+        let mut transaction = self.begin();
+        let results = transaction.execute(source)?;
+        transaction.commit()?;
+        Ok(results)
+    }
+
+    fn commit_graph(&mut self, graph: Graph, sources: &[String]) -> Result<()> {
+        if sources.is_empty() {
+            return Ok(());
+        }
+
+        let sequence = self.last_sequence + 1;
+        if let Some(storage) = &mut self.storage {
+            let payload = sources.join("\n;\n");
+            storage.append(sequence, payload.as_bytes())?;
+        }
+
+        self.graph = graph;
+        self.last_sequence = sequence;
+        Ok(())
+    }
+
+    fn execute_in_place(&mut self, source: &str) -> Result<Vec<QueryResult>> {
         let statements = parse_program(source)?;
         if statements.is_empty() {
             return Err(Error::new("empty query"));
@@ -1328,6 +1451,99 @@ impl Database {
             ))),
             other => Err(Error::new(format!("unknown function `{other}`"))),
         }
+    }
+}
+
+/// An explicit multi-statement transaction.
+///
+/// A transaction stages its first write in a graph copy. `commit` appends one
+/// durable WAL record and installs the staged graph; dropping or calling
+/// [`Transaction::rollback`] discards it.
+pub struct Transaction<'a> {
+    db: &'a mut Database,
+    staged: Option<Graph>,
+    sources: Vec<String>,
+    failed: bool,
+}
+
+impl<'a> Transaction<'a> {
+    /// Execute statements inside this transaction.
+    pub fn execute(&mut self, source: &str) -> Result<Vec<QueryResult>> {
+        if self.failed {
+            return Err(Error::new(
+                "transaction is aborted; start a new transaction to continue",
+            ));
+        }
+
+        let statements = match parse_program(source) {
+            Ok(statements) => statements,
+            Err(error) => {
+                self.failed = true;
+                return Err(error);
+            }
+        };
+        if statements.is_empty() {
+            self.failed = true;
+            return Err(Error::new("empty query"));
+        }
+
+        let writes = statements.iter().any(Statement::is_write);
+
+        if !writes && self.staged.is_none() {
+            let result = self.db.execute_in_place(source);
+            if result.is_err() {
+                self.failed = true;
+            }
+            return result;
+        }
+
+        if self.staged.is_none() {
+            self.staged = Some(self.db.graph.clone());
+        }
+
+        let live = std::mem::replace(
+            &mut self.db.graph,
+            self.staged.take().expect("staged graph exists"),
+        );
+        let result = self.db.execute_in_place(source);
+        self.staged = Some(std::mem::replace(&mut self.db.graph, live));
+
+        match result {
+            Ok(results) => {
+                if writes {
+                    self.sources.push(source.to_string());
+                }
+                Ok(results)
+            }
+            Err(error) => {
+                self.failed = true;
+                Err(error)
+            }
+        }
+    }
+
+    /// Durably commit the transaction.
+    pub fn commit(mut self) -> Result<()> {
+        if self.failed {
+            return Err(Error::new(
+                "cannot commit: the transaction is aborted; no changes were applied",
+            ));
+        }
+
+        match self.staged.take() {
+            Some(graph) => {
+                let sources = std::mem::take(&mut self.sources);
+                self.db.commit_graph(graph, &sources)
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Discard all changes made inside the transaction.
+    pub fn rollback(self) {}
+
+    pub fn is_failed(&self) -> bool {
+        self.failed
     }
 }
 
