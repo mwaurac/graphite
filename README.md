@@ -36,7 +36,7 @@ graphite> MATCH (a:Person)-[:KNOWS]->(b:Person)
 
 ## Quick start
 
-Requires Rust 1.75 or newer.
+Requires Rust 1.89 or newer.
 
 ```bash
 # Interactive shell
@@ -224,9 +224,11 @@ tx.rollback(); // nothing is written
 
 A transaction that hits an execution error is aborted and cannot be committed.
 Read-only transactions do not copy the graph; the first write stages a graph copy
-for atomic commit. Only one writer can exist at a time, and there is no
-multi-process locking yet. See [`docs/MILESTONE-2.md`](docs/MILESTONE-2.md) for the
-on-disk format, crash windows, and current limitations.
+for atomic commit. A persistent database directory is exclusively locked while it
+is open, so a second process receives a clear error instead of corrupting the WAL.
+There is no shared-reader mode yet. See
+[`docs/MILESTONE-2.md`](docs/MILESTONE-2.md) for the on-disk format, crash windows,
+and current limitations.
 
 The query language is also still an import/export format. A snapshot is a valid
 Graphite script:
@@ -296,6 +298,7 @@ Implemented:
   protection
 - A checksummed write-ahead log, atomic snapshot checkpoints, and torn-tail crash
   recovery
+- An exclusive process lock on each persistent database directory
 - Persistent database directories and snapshot save/load using the query language
   as the file format
 - Positioned syntax errors and end-to-end tests, including recovery tests

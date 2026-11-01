@@ -8,9 +8,9 @@
 databases have that Graphite does not, and where to invest next.
 
 > **Update:** Milestone 2a now adds atomic transactions, WAL durability, crash
-> recovery, and atomic snapshots. The gap analysis below is kept as the original
-> assessment; for what has since been implemented and what remains, see
-> [`MILESTONE-2.md`](MILESTONE-2.md).
+> recovery, atomic snapshots, and directory locking. The gap analysis below is
+> kept as the original assessment; for what has since been implemented and what
+> remains, see [`MILESTONE-2.md`](MILESTONE-2.md).
 
 ---
 

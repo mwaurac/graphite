@@ -32,6 +32,9 @@ Milestone 2a adds:
    after the new snapshot is durable.
 7. **Persistent CLI mode.** `graphite --db <dir>` opens or creates a database
    directory. `:checkpoint` forces a snapshot and WAL truncation.
+8. **Process locking.** An exclusive advisory lock on `<dir>/db.lock` is held for
+   the lifetime of the database handle, so a second process cannot append to or
+   recover the same directory concurrently.
 
 The language, graph model, and query results are unchanged.
 
@@ -71,6 +74,7 @@ A persistent database is a directory:
 
 ```text
 data/social/
+  db.lock           advisory exclusive lock held while the database is open
   snapshot.gql      graph as of a sequence number, written atomically
   wal.log           append-only records for commits after the snapshot
 ```
@@ -137,7 +141,27 @@ The ordering makes the interesting crash windows safe:
 
 ---
 
-## 4. Tests added
+## 4. Process safety
+
+A persistent database is protected by an exclusive advisory file lock on
+`db.lock`. `Database::open` acquires the lock before it reads the snapshot or WAL,
+so recovery cannot race another process. The lock is released when the `Database`
+(and its `Storage` handle) is dropped or the process exits.
+
+A second `Database::open` for the same directory returns:
+
+```text
+database `data/social` is already open by another process
+```
+
+The lock is advisory: it only protects programs that cooperate with it. It also
+excludes concurrent readers, because Graphite does not yet have a read-only mode
+or MVCC. Filesystems that do not support locking report an error rather than
+silently running unprotected.
+
+---
+
+## 5. Tests added
 
 `tests/durability.rs` covers:
 
@@ -152,15 +176,18 @@ The ordering makes the interesting crash windows safe:
 - A torn WAL tail is ignored.
 - A corrupt WAL header is rejected.
 - Reopening compacts the WAL and preserves the snapshot sequence.
+- A database directory cannot be opened twice while a handle is alive.
+- The lock is released when the handle is dropped.
 
 `src/storage.rs` unit tests cover WAL round-trips, appending after reopening an
 existing log, torn tails, header repair, checksum corruption, snapshot sequence
-parsing, and checkpoint truncation. `tests/cli.rs` adds persistent CLI round-trips
-and checks that a failed CLI query does not persist partial writes.
+parsing, checkpoint truncation, and directory locking. `tests/cli.rs` adds
+persistent CLI round-trips and checks that a failed CLI query does not persist
+partial writes.
 
 ---
 
-## 5. Known limitations
+## 6. Known limitations
 
 These are deliberate cuts for this slice, not accidental omissions:
 
@@ -173,8 +200,9 @@ These are deliberate cuts for this slice, not accidental omissions:
   A production design needs incremental checkpoints or a log-structured store.
 - **The WAL grows until an explicit checkpoint or reopen.** There is no background
   checkpoint policy, group commit, or WAL size limit.
-- **No file locking.** Two processes can open the same directory and corrupt each
-  other's WAL. A lock file with advisory locking is required.
+- **Exclusive advisory locking only.** The lock excludes concurrent readers as
+  well as writers, and it relies on programs cooperating with the lock. There is
+  no read-only or shared-lock mode yet.
 - **No CRC protection for snapshots.** Snapshot corruption is detected only when
   the script fails to parse or execute.
 - **No format version migration.** Snapshot and WAL formats are versioned by
@@ -184,8 +212,9 @@ These are deliberate cuts for this slice, not accidental omissions:
 
 ### Transactions and concurrency
 
-- **Single writer, no readers during a write.** `&mut Database` prevents sharing
-  within Rust, but there is no multi-process protection or MVCC.
+- **Single writer, no concurrent readers.** `&mut Database` prevents sharing
+  within Rust, and the directory lock excludes other processes entirely; there is
+  no MVCC or read-only mode.
 - **No isolation levels.** A transaction sees its own staged writes; other
   transactions cannot run concurrently because of the mutable borrow.
 - **Abort-on-first-error.** There are no savepoints.
@@ -211,32 +240,30 @@ These are deliberate cuts for this slice, not accidental omissions:
 
 ---
 
-## 6. Recommended next steps
+## 7. Recommended next steps
 
 In priority order:
 
-1. **Process locking** so a database directory has a single writer across
-   processes. This is the most serious remaining safety gap.
-2. **Undo-log transactions** to remove the whole-graph clone per write.
-3. **Savepoints and statement-level error recovery** for long transactions.
-4. **Semantic analysis before mutation** to reject invalid label/property updates
+1. **Undo-log transactions** to remove the whole-graph clone per write.
+2. **Savepoints and statement-level error recovery** for long transactions.
+3. **Semantic analysis before mutation** to reject invalid label/property updates
    and bound-variable reuse up front.
-5. **Constraints and unique indexes**, especially uniqueness on a chosen identity
+4. **Constraints and unique indexes**, especially uniqueness on a chosen identity
    property.
-6. **Checkpoint policy** based on WAL bytes or commit count, with an online
+5. **Checkpoint policy** based on WAL bytes or commit count, with an online
    checkpoint that does not stall large writes.
-7. **Parameterised queries**, then property indexes and `EXPLAIN`.
-8. **Snapshot checksums and format versioning**, then migration tests.
-9. **Multi-process/server mode and MVCC** only after the single-node storage
-   layer is efficient.
+6. **Parameterised queries**, then property indexes and `EXPLAIN`.
+7. **Snapshot checksums and format versioning**, then migration tests.
+8. **Read-only/shared locking, multi-process server mode, and MVCC** after the
+   single-node storage layer is efficient.
 
 ---
 
-## 7. How this changes the Milestone 1 assessment
+## 8. How this changes the Milestone 1 assessment
 
 The Milestone 1 gap analysis listed statement atomicity, WAL durability, crash
 recovery, and a transaction API as the top four recommendations. This slice
-implements the single-process versions of all four. The remaining top gap is
-**process safety**: without locking, the storage engine is still not safe to share
-between programs. After that, performance work (copy-free transactions and
-incremental checkpoints) matters more than new syntax.
+implements the single-process versions of all four, and adds an exclusive
+directory lock so separate processes cannot corrupt the same WAL. The remaining
+top gap is **performance**: copy-free transactions and incremental checkpoints
+matter more now than new syntax.
