@@ -174,6 +174,9 @@ impl Database {
     /// snapshot sequence, then checkpoints so the WAL starts clean.
     pub fn open(directory: impl AsRef<Path>) -> Result<Self> {
         let directory = directory.as_ref();
+        // Take the directory lock before reading any state, so recovery cannot
+        // race another process.
+        let storage_handle = Storage::open(directory)?;
         let snapshot = storage::read_snapshot(directory)?;
 
         let mut db = match snapshot {
@@ -209,7 +212,7 @@ impl Database {
             db.last_sequence = sequence;
         }
 
-        db.storage = Some(Storage::open(directory)?);
+        db.storage = Some(storage_handle);
         if had_records {
             db.checkpoint()?;
         }

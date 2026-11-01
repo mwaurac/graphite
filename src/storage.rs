@@ -10,12 +10,14 @@ const MAX_RECORD_SIZE: u64 = 64 * 1024 * 1024;
 
 pub const SNAPSHOT_FILE: &str = "snapshot.gql";
 pub const WAL_FILE: &str = "wal.log";
+pub const LOCK_FILE: &str = "db.lock";
 
 /// Durable storage for one database directory.
 ///
 /// Layout:
 /// - `snapshot.gql` — the graph as of `sequence`, written atomically.
 /// - `wal.log` — append-only transaction log for commits after the snapshot.
+/// - `db.lock` — advisory exclusive lock held for the lifetime of the handle.
 ///
 /// Each WAL record is `[sequence: u64][length: u64][crc32: u32][payload]`.
 /// Recovery reads records until the first incomplete or corrupt record, which
@@ -23,6 +25,7 @@ pub const WAL_FILE: &str = "wal.log";
 #[derive(Debug)]
 pub struct Storage {
     directory: PathBuf,
+    _lock: File,
     wal: File,
 }
 
@@ -34,6 +37,36 @@ impl Storage {
                 directory.display()
             ))
         })?;
+
+        let lock_path = directory.join(LOCK_FILE);
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|error| {
+                Error::new(format!(
+                    "cannot open database lock `{}`: {error}",
+                    lock_path.display()
+                ))
+            })?;
+
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(Error::new(format!(
+                    "database `{}` is already open by another process",
+                    directory.display()
+                )));
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(Error::new(format!(
+                    "cannot lock database `{}`: {error}",
+                    directory.display()
+                )));
+            }
+        }
 
         let wal_path = directory.join(WAL_FILE);
         let mut wal = OpenOptions::new()
@@ -82,6 +115,7 @@ impl Storage {
 
         Ok(Storage {
             directory: directory.to_path_buf(),
+            _lock: lock,
             wal,
         })
     }
@@ -373,6 +407,18 @@ mod tests {
         assert_eq!(records[0].0, 1);
         assert_eq!(records[0].1, b"CREATE (:A);");
         assert_eq!(records[1].0, 2);
+    }
+
+    #[test]
+    fn locks_a_database_directory_until_dropped() {
+        let directory = TempDirectory::new();
+        let storage = Storage::open(&directory.0).unwrap();
+
+        let error = Storage::open(&directory.0).unwrap_err();
+        assert!(error.message.contains("already open"));
+
+        drop(storage);
+        Storage::open(&directory.0).unwrap();
     }
 
     #[test]

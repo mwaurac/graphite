@@ -117,6 +117,18 @@ fn a_parse_error_aborts_an_explicit_transaction() {
 }
 
 #[test]
+fn a_database_directory_is_locked_while_open() {
+    let directory = TempDirectory::new();
+    let db = Database::open(&directory.0).unwrap();
+
+    let error = Database::open(&directory.0).unwrap_err();
+    assert!(error.message.contains("already open"));
+
+    drop(db);
+    Database::open(&directory.0).unwrap();
+}
+
+#[test]
 fn read_only_transactions_do_not_advance_the_sequence() {
     let mut db = Database::new();
     db.execute("CREATE (:Person)").unwrap();
