@@ -9,50 +9,102 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
-    let mut db = Database::new();
+    let mut directory: Option<String> = None;
+    let mut action: Option<Action> = None;
 
-    if args.is_empty() {
-        if io::stdin().is_terminal() {
-            return repl(&mut db);
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-h" | "--help" => {
+                print_help();
+                return ExitCode::SUCCESS;
+            }
+            "-V" | "--version" => {
+                println!("graphite {VERSION}");
+                return ExitCode::SUCCESS;
+            }
+            "--db" => {
+                let Some(path) = args.get(index + 1) else {
+                    eprintln!("error: --db requires a directory");
+                    return ExitCode::from(2);
+                };
+                if directory.replace(path.clone()).is_some() {
+                    eprintln!("error: --db can only be specified once");
+                    return ExitCode::from(2);
+                }
+                index += 2;
+            }
+            "-e" | "--execute" => {
+                let Some(query) = args.get(index + 1) else {
+                    eprintln!("error: {} requires a query argument", args[index]);
+                    return ExitCode::from(2);
+                };
+                if action.is_some() {
+                    eprintln!("error: only one of --execute or --file may be used");
+                    return ExitCode::from(2);
+                }
+                action = Some(Action::Execute(query.clone()));
+                index += 2;
+            }
+            "-f" | "--file" => {
+                let Some(path) = args.get(index + 1) else {
+                    eprintln!("error: {} requires a file path", args[index]);
+                    return ExitCode::from(2);
+                };
+                if action.is_some() {
+                    eprintln!("error: only one of --execute or --file may be used");
+                    return ExitCode::from(2);
+                }
+                action = Some(Action::File(path.clone()));
+                index += 2;
+            }
+            other if other.starts_with('-') => {
+                eprintln!("error: unknown option `{other}`");
+                eprintln!("run `graphite --help` for usage");
+                return ExitCode::from(2);
+            }
+            path => {
+                if action.is_some() {
+                    eprintln!("error: only one script file may be provided");
+                    return ExitCode::from(2);
+                }
+                action = Some(Action::File(path.to_string()));
+                index += 1;
+            }
         }
-        let mut source = String::new();
-        if let Err(error) = io::stdin().read_to_string(&mut source) {
-            eprintln!("error: failed to read stdin: {error}");
-            return ExitCode::from(1);
-        }
-        return run_source(&mut db, &source);
     }
 
-    match args[0].as_str() {
-        "-h" | "--help" => {
-            print_help();
-            ExitCode::SUCCESS
+    let mut db = match &directory {
+        Some(directory) => match Database::open(directory) {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+        },
+        None => Database::new(),
+    };
+
+    match action {
+        Some(Action::Execute(query)) => run_source(&mut db, &query),
+        Some(Action::File(path)) => run_file(&mut db, &path),
+        None => {
+            if io::stdin().is_terminal() {
+                return repl(&mut db);
+            }
+            let mut source = String::new();
+            if let Err(error) = io::stdin().read_to_string(&mut source) {
+                eprintln!("error: failed to read stdin: {error}");
+                return ExitCode::from(1);
+            }
+            run_source(&mut db, &source)
         }
-        "-V" | "--version" => {
-            println!("graphite {VERSION}");
-            ExitCode::SUCCESS
-        }
-        "-e" | "--execute" => {
-            let Some(query) = args.get(1) else {
-                eprintln!("error: {} requires a query argument", args[0]);
-                return ExitCode::from(2);
-            };
-            run_source(&mut db, query)
-        }
-        "-f" | "--file" => {
-            let Some(path) = args.get(1) else {
-                eprintln!("error: {} requires a file path", args[0]);
-                return ExitCode::from(2);
-            };
-            run_file(&mut db, path)
-        }
-        other if other.starts_with('-') => {
-            eprintln!("error: unknown option `{other}`");
-            eprintln!("run `graphite --help` for usage");
-            ExitCode::from(2)
-        }
-        path => run_file(&mut db, path),
     }
+}
+
+enum Action {
+    Execute(String),
+    File(String),
 }
 
 fn run_file(db: &mut Database, path: &str) -> ExitCode {
@@ -212,28 +264,43 @@ fn run_command(db: &mut Database, command: &str) -> CommandOutcome {
     match parts.next().unwrap_or("") {
         ":quit" | ":exit" | ":q" => return CommandOutcome::Quit,
         ":help" | ":h" | ":?" => print_repl_help(),
-        ":clear" => {
-            *db = Database::new();
-            println!("Database cleared.");
-        }
-        ":demo" => {
-            *db = Database::new();
-            match db.execute(DEMO_QUERY) {
-                Ok(_) => println!(
-                    "Loaded demo graph: {} nodes, {} relationships.",
-                    db.graph().node_count(),
-                    db.graph().edge_count()
-                ),
-                Err(error) => eprintln!("error: {error}"),
-            }
-        }
+        ":clear" => match replace_database(db, "") {
+            Ok(()) => println!("Database cleared."),
+            Err(error) => eprintln!("error: {error}"),
+        },
+        ":demo" => match replace_database(db, DEMO_QUERY) {
+            Ok(()) => println!(
+                "Loaded demo graph: {} nodes, {} relationships.",
+                db.graph().node_count(),
+                db.graph().edge_count()
+            ),
+            Err(error) => eprintln!("error: {error}"),
+        },
         ":stats" => {
-            println!(
+            let mut line = format!(
                 "{} nodes, {} relationships",
                 db.graph().node_count(),
                 db.graph().edge_count()
             );
+            if let Some(directory) = db.directory() {
+                line.push_str(&format!(
+                    ", sequence {} (persistent at {})",
+                    db.last_sequence(),
+                    directory.display()
+                ));
+            }
+            println!("{line}");
         }
+        ":checkpoint" => match db.checkpoint() {
+            Ok(()) => {
+                if db.directory().is_some() {
+                    println!("Checkpointed at sequence {}.", db.last_sequence());
+                } else {
+                    println!("Nothing to checkpoint: this database is in memory.");
+                }
+            }
+            Err(error) => eprintln!("error: {error}"),
+        },
         ":save" => {
             let path = command_argument(command);
             match path {
@@ -253,15 +320,12 @@ fn run_command(db: &mut Database, command: &str) -> CommandOutcome {
             match path {
                 None => eprintln!("usage: :load <file>"),
                 Some(path) => match fs::read_to_string(path) {
-                    Ok(source) => match Database::from_script(&source) {
-                        Ok(loaded) => {
-                            *db = loaded;
-                            println!(
-                                "Loaded {} nodes and {} relationships from `{path}`.",
-                                db.graph().node_count(),
-                                db.graph().edge_count()
-                            );
-                        }
+                    Ok(source) => match replace_database(db, &source) {
+                        Ok(()) => println!(
+                            "Loaded {} nodes and {} relationships from `{path}`.",
+                            db.graph().node_count(),
+                            db.graph().edge_count()
+                        ),
                         Err(error) => eprintln!("error: {error}"),
                     },
                     Err(error) => eprintln!("error: cannot read `{path}`: {error}"),
@@ -273,6 +337,16 @@ fn run_command(db: &mut Database, command: &str) -> CommandOutcome {
         }
     }
     CommandOutcome::Continue
+}
+
+fn replace_database(db: &mut Database, source: &str) -> graphite::Result<()> {
+    let statements = parse_program(source)?;
+    let mut transaction = db.begin();
+    transaction.execute("MATCH (n) DETACH DELETE n")?;
+    if !statements.is_empty() {
+        transaction.execute(source)?;
+    }
+    transaction.commit()
 }
 
 fn command_argument(command: &str) -> Option<&str> {
@@ -301,6 +375,7 @@ fn print_repl_help() {
     println!("  :help              show this help");
     println!("  :demo              reset and load a small sample graph");
     println!("  :stats             show node and relationship counts");
+    println!("  :checkpoint        snapshot a persistent database and clear its WAL");
     println!("  :save <file>       save the graph as a Graphite script");
     println!("  :load <file>       replace the graph with a saved script");
     println!("  :clear             remove all data");
@@ -324,7 +399,10 @@ fn print_help() {
     println!("  graphite <file.gql>         run statements from a file");
     println!("  graphite -e <query>         run a query");
     println!("  graphite -f <file.gql>      run statements from a file");
+    println!("  graphite --db <dir>         open or create a persistent database");
+    println!("  graphite --db <dir> -e ...  run a query against a persistent database");
     println!("  graphite --help             show this help");
     println!();
-    println!("Data lives in memory for this milestone.");
+    println!("Without --db, data lives in memory. With --db, committed transactions");
+    println!("are recorded in <dir>/wal.log and recovered on startup.");
 }
