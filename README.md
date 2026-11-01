@@ -3,13 +3,16 @@
 A small property graph database with its own query language, written in Rust with
 no external dependencies.
 
-This repository is the **first milestone**: a single-process, in-memory graph
-engine with a hand-written lexer, parser, and executor. It is meant to be small
-enough to read end-to-end, while still supporting real graph traversal queries.
+This repository currently contains **Milestone 2a**: a single-process graph engine
+with a hand-written lexer, parser, and executor, plus atomic transactions,
+write-ahead-log durability, and crash recovery. It is small enough to read
+end-to-end while still supporting real graph traversal queries.
 
 For a detailed status report, a gap analysis against production graph databases,
 and a prioritized roadmap, see
-[`docs/MILESTONE-1.md`](docs/MILESTONE-1.md).
+[`docs/MILESTONE-1.md`](docs/MILESTONE-1.md). For the transaction and durability
+design added in Milestone 2a, see
+[`docs/MILESTONE-2.md`](docs/MILESTONE-2.md).
 
 ```text
 $ cargo run
@@ -45,6 +48,10 @@ cargo run -- -e 'CREATE (n:Person {name: "Alice"}) RETURN n'
 # Run a script
 cargo run -- examples/social.gql
 
+# Open a persistent database (creates the directory if needed)
+cargo run -- --db data/social
+cargo run -- --db data/social -e 'MATCH (n) RETURN count(*)'
+
 # Run the test suite
 cargo test
 ```
@@ -55,7 +62,8 @@ Inside the shell:
 | --- | --- |
 | `:help` | Show help and query examples |
 | `:demo` | Reset the database and load a sample social graph |
-| `:stats` | Show node and relationship counts |
+| `:stats` | Show counts, sequence number, and storage directory |
+| `:checkpoint` | Snapshot a persistent database and truncate its WAL |
 | `:save <file>` | Save the graph as a Graphite script |
 | `:load <file>` | Replace the graph with a saved script |
 | `:clear` | Remove all data |
@@ -169,10 +177,12 @@ MATCH (p:Person) DETACH DELETE p RETURN p.name;
 - `CREATE` cannot attach labels/properties to an already-bound variable; refer to
   it as `(existing)` instead.
 
-## Persistence
+## Durability and transactions
 
-Graphite snapshots are stored as Graphite scripts, so the database's own query
-language doubles as its import/export format:
+Graphite has two modes.
+
+**In-memory** is the default. It is useful for exploration and tests, and can be
+saved explicitly as a Graphite script:
 
 ```text
 graphite> :demo
@@ -182,15 +192,49 @@ graphite> :load social.gql
 Loaded 6 nodes and 7 relationships from `social.gql`.
 ```
 
-From Rust:
+**Persistent** mode is enabled with `--db <directory>` or `Database::open`:
+
+```bash
+cargo run -- --db data/social
+```
+
+The directory contains `snapshot.gql` and `wal.log`. Each committed transaction
+is appended to the WAL and `fsync`ed before the commit returns. On startup the
+snapshot is loaded, valid WAL records are replayed, and the database checkpoints.
+A torn final WAL record is ignored, so an interrupted write is treated as a
+transaction that never committed.
+
+Every `Database::execute` call is atomic: if any statement fails, none of that
+call's changes are applied. For larger units of work, use an explicit transaction:
+
+```rust
+use graphite::Database;
+
+let mut db = Database::open("data/social")?;
+
+let mut tx = db.begin();
+tx.execute(r#"CREATE (:Person {name: "Alice"})"#)?;
+tx.execute(r#"CREATE (:Person {name: "Bob"})"#)?;
+tx.commit()?; // one durable WAL record
+
+let mut tx = db.begin();
+tx.execute(r#"CREATE (:Person {name: "Discarded"})"#)?;
+tx.rollback(); // nothing is written
+```
+
+A transaction that hits an execution error is aborted and cannot be committed.
+Read-only transactions do not copy the graph; the first write stages a graph copy
+for atomic commit. Only one writer can exist at a time, and there is no
+multi-process locking yet. See [`docs/MILESTONE-2.md`](docs/MILESTONE-2.md) for the
+on-disk format, crash windows, and current limitations.
+
+The query language is also still an import/export format. A snapshot is a valid
+Graphite script:
 
 ```rust
 let snapshot = db.dump();                  // a valid Graphite script
 let restored = Database::from_script(&snapshot)?;
 ```
-
-This is a snapshot mechanism, not a durable storage engine: writes are explicit,
-there is no write-ahead log or transactional recovery yet.
 
 ## Library API
 
@@ -227,16 +271,18 @@ src/
   ast.rs        statements, patterns, expressions
   parser.rs     recursive-descent parser
   graph.rs      property graph, label index, adjacency index
-  executor.rs   pattern matching, mutation, projection, aggregation
+  executor.rs   transactions, pattern matching, mutation, aggregation
+  storage.rs    WAL, atomic snapshots, crash recovery
   serial.rs     graph snapshots as Graphite scripts
   value.rs      values and their formatting/ordering
   error.rs      positioned errors
   main.rs       CLI, REPL, table rendering
-tests/query.rs  end-to-end language tests
-examples/       sample script
+tests/query.rs       end-to-end language tests
+tests/durability.rs  transaction and crash-recovery tests
+examples/            sample script
 ```
 
-## First milestone scope
+## Current scope
 
 Implemented:
 
@@ -246,19 +292,26 @@ Implemented:
 - Filtering, property maps, aggregates, grouping, `DISTINCT`, `ORDER BY`,
   `SKIP`, `LIMIT`
 - REPL with multiline input, scripts, single-query execution, and library API
-- Snapshot save/load using the query language as the file format
-- Positioned syntax errors and end-to-end tests
+- Atomic scripts, explicit commit/rollback transactions, and aborted-transaction
+  protection
+- A checksummed write-ahead log, atomic snapshot checkpoints, and torn-tail crash
+  recovery
+- Persistent database directories and snapshot save/load using the query language
+  as the file format
+- Positioned syntax errors and end-to-end tests, including recovery tests
 
 Deliberately not in this milestone:
 
-- Transactions, concurrency, and durable crash recovery
+- Multi-process file locking, concurrency, MVCC, or configurable isolation
 - Variable-length paths, `MERGE`, `OPTIONAL MATCH`, `UNWIND`, parameters
 - Multiple relationship types and richer expressions/functions
-- A cost-based planner and an on-disk storage engine
+- Constraints and unique indexes
+- A cost-based planner and an efficient on-disk storage engine
 
-Those are the natural next milestones. The executor already isolates storage
-behind `graph.rs`, so a persistent backend can replace the in-memory maps without
-changing the language layer.
+The transaction layer currently stages a whole-graph copy on the first write, and
+checkpoints serialise the entire graph. Those are the main performance limits to
+address next, along with process locking. See
+[`docs/MILESTONE-2.md`](docs/MILESTONE-2.md).
 
 ## License
 
